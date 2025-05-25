@@ -33,3 +33,12 @@ runs/
 
 # Dependencies
 node_modules/
+
+datasets/
+tests/
+yolo11n.pt
+yolo11s.pt
+docker/
+docs/
+examples/
+
