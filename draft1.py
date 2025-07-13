@@ -1,7 +1,5 @@
-from ultralytics import YOLO
-
-# Load the model
-model = YOLO("yolo11n.pt")
-
-# Export the model to ONNX format
-model.export(format="onnx")
+import torch
+print(torch.__version__)
+print(torch.cuda.is_available()) # 查看CUDA是否可用
+print(torch.cuda.device_count()) # 查看可用的CUDA数量
+print(torch.version.cuda) # 查看CUDA的版本号
