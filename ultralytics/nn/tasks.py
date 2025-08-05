@@ -12,6 +12,15 @@ import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
+    C2fPSAODSwin,
+    PSABlockSwin,
+    BiFPN,
+    EMA,
+    AttentionOdconv2d,
+    ODConv,
+    ODConv2d,
+    C2fOD,
+    C2fPSAOD,
     AIFI,
     C1,
     C2,
@@ -583,8 +592,29 @@ class ClassificationModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the ClassificationModel."""
-        return v8ClassificationLoss()
+        # return v8ClassificationLoss()
+        return FineGrainedLoss(self.yaml["nc"])
 
+class FineGrainedLoss(nn.Module):
+    def __init__(self, nc):
+        super().__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.triplet_loss = nn.TripletMarginLoss(margin=0.5, p=2)
+
+    def forward(self, preds, batch):
+        # preds: (分类logits, 特征向量)
+        logits, feats = preds
+        labels = batch["cls"].squeeze(-1).long()
+
+        # 交叉熵损失
+        ce = self.ce_loss(logits, labels)
+
+        # 三元组损失（随机采样正/负样本）
+        idx = torch.randperm(feats.shape[0])
+        anchor, positive, negative = feats, feats[idx], feats[(idx+1) % feats.shape[0]]
+        triplet = self.triplet_loss(anchor, positive, negative)
+
+        return ce + 0.1 * triplet  # 加权融合
 
 class RTDETRDetectionModel(DetectionModel):
     """
@@ -1426,10 +1456,21 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             SCDown,
             C2fCIB,
             A2C2f,
+            EMA,
+            ODConv,
+            ODConv2d,
+            AttentionOdconv2d,
+            C2fPSAOD,
+            C2fOD,
+            C2fPSAODSwin,
+            PSABlockSwin,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
         {
+            C2fPSAODSwin,
+            C2fPSAOD,
+            C2fOD,
             BottleneckCSP,
             C1,
             C2,
@@ -1516,6 +1557,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        # 在parse_model函数中添加BiFPN处理逻辑
+        elif m is BiFPN:
+            # c1是输入通道列表，c2是输出通道
+            input_channels = [ch[x] for x in f]  # 获取所有输入层的通道数
+            c2 = args[0]  # 输出通道数（YAML中第一个参数）
+            args = [input_channels] + args  # 重新组织参数：[输入通道列表, 输出通道, 其他参数...]
+
         else:
             c2 = ch[f]
 

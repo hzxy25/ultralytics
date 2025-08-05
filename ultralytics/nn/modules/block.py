@@ -11,6 +11,15 @@ from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
+    "C2fPSAODSwin",
+    "PSABlockSwin",
+    "BiFPN",
+    "EMA",
+    "AttentionOdconv2d",
+    "ODConv",
+    "ODConv2d",
+    "C2fOD",
+    "C2fPSAOD",
     "DFL",
     "HGBlock",
     "HGStem",
@@ -1964,3 +1973,583 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+#下面是新添加
+
+class EMA(nn.Module):
+    def __init__(self, channels, factor=32):
+        super(EMA, self).__init__()
+        self.groups = factor
+        assert channels // self.groups > 0
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(channels // self.groups, channels // self.groups)
+        self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
+        self.conv3x3 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        group_x = x.reshape(b * self.groups, -1, h, w)  # b*g,c//g,h,w
+        x_h = self.pool_h(group_x)
+        x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(group_x)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (group_x * weights.sigmoid()).reshape(b, c, h, w)
+
+class AttentionOdconv2d(nn.Module):
+
+    def __init__(self, in_planes, out_planes, kernel_size, groups=1, reduction=0.0625, kernel_num=4, min_channel=16):
+        super(AttentionOdconv2d, self).__init__()
+        attention_channel = max(int(in_planes * reduction), min_channel)
+        self.kernel_size = kernel_size
+        self.kernel_num = kernel_num
+        self.temperature = 1.0
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Conv2d(in_planes, attention_channel, 1, bias=False)
+        self.bn = nn.BatchNorm2d(attention_channel)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.channel_fc = nn.Conv2d(attention_channel, in_planes, 1, bias=True)
+        self.func_channel = self.get_channel_attention
+
+        if in_planes == groups and in_planes == out_planes:  # depth-wise convolution
+            self.func_filter = self.skip
+        else:
+            self.filter_fc = nn.Conv2d(attention_channel, out_planes, 1, bias=True)
+            self.func_filter = self.get_filter_attention
+
+        if kernel_size == 1:  # point-wise convolution
+            self.func_spatial = self.skip
+        else:
+            self.spatial_fc = nn.Conv2d(attention_channel, kernel_size * kernel_size, 1, bias=True)
+            self.func_spatial = self.get_spatial_attention
+
+        if kernel_num == 1:
+            self.func_kernel = self.skip
+        else:
+            self.kernel_fc = nn.Conv2d(attention_channel, kernel_num, 1, bias=True)
+            self.func_kernel = self.get_kernel_attention
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def update_temperature(self, temperature):
+        self.temperature = temperature
+
+    @staticmethod
+    def skip(_):
+        return 1.0
+
+    def get_channel_attention(self, x):
+        channel_attention = torch.sigmoid(self.channel_fc(x).view(x.size(0), -1, 1, 1) / self.temperature)
+        return channel_attention
+
+    def get_filter_attention(self, x):
+        filter_attention = torch.sigmoid(self.filter_fc(x).view(x.size(0), -1, 1, 1) / self.temperature)
+        return filter_attention
+
+    def get_spatial_attention(self, x):
+        spatial_attention = self.spatial_fc(x).view(x.size(0), 1, 1, 1, self.kernel_size, self.kernel_size)
+        spatial_attention = torch.sigmoid(spatial_attention / self.temperature)
+        return spatial_attention
+
+    def get_kernel_attention(self, x):
+        kernel_attention = self.kernel_fc(x).view(x.size(0), -1, 1, 1, 1, 1)
+        kernel_attention = F.softmax(kernel_attention / self.temperature, dim=1)
+        return kernel_attention
+
+    def forward(self, x):
+        x = self.avgpool(x)
+        x = self.fc(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return self.func_channel(x), self.func_filter(x), self.func_spatial(x), self.func_kernel(x)
+
+class ODConv2d(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1,
+                 reduction=0.0625, kernel_num=4):
+        super(ODConv2d, self).__init__()
+        self.in_planes = in_planes
+        self.out_planes = out_planes
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.kernel_num = kernel_num
+
+        # 添加校验
+        assert self.groups > 0, "groups must be a positive integer"
+        assert self.in_planes % self.groups == 0, "in_planes must be divisible by groups"
+        assert self.groups <= self.in_planes, "groups should be less than or equal to in_planes"
+
+        self.attention = AttentionOdconv2d(in_planes, out_planes, kernel_size, groups=groups,
+                                           reduction=reduction, kernel_num=kernel_num)
+        self.weight = nn.Parameter(torch.randn(kernel_num, out_planes, in_planes // groups, kernel_size, kernel_size),
+                                   requires_grad=True)
+        self._initialize_weights()
+
+        if self.kernel_size == 1 and self.kernel_num == 1:
+            self._forward_impl = self._forward_impl_pw1x
+        else:
+            self._forward_impl = self._forward_impl_common
+
+    def _initialize_weights(self):
+        for i in range(self.kernel_num):
+            nn.init.kaiming_normal_(self.weight[i], mode='fan_out', nonlinearity='relu')
+
+    def update_temperature(self, temperature):
+        self.attention.update_temperature(temperature)
+
+    def _forward_impl_common(self, x):
+        # Multiplying channel attention (or filter attention) to weights and feature maps are equivalent,
+        # while we observe that when using the latter method the models will run faster with less gpu memory cost.
+        channel_attention, filter_attention, spatial_attention, kernel_attention = self.attention(x)
+        batch_size, in_planes, height, width = x.size()
+        x = x * channel_attention
+        x = x.reshape(1, -1, height, width)
+        aggregate_weight = spatial_attention * kernel_attention * self.weight.unsqueeze(dim=0)
+        aggregate_weight = torch.sum(aggregate_weight, dim=1).view(
+            [-1, self.in_planes // self.groups, self.kernel_size, self.kernel_size])
+        output = F.conv2d(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
+                          dilation=self.dilation, groups=self.groups * batch_size)
+        output = output.view(batch_size, self.out_planes, output.size(-2), output.size(-1))
+        output = output * filter_attention
+        return output
+
+    def _forward_impl_pw1x(self, x):
+        channel_attention, filter_attention, spatial_attention, kernel_attention = self.attention(x)
+        x = x * channel_attention
+        output = F.conv2d(x, weight=self.weight.squeeze(dim=0), bias=None, stride=self.stride, padding=self.padding,
+                          dilation=self.dilation, groups=self.groups)
+        output = output * filter_attention
+        return output
+
+    def forward(self, x):
+        return self._forward_impl(x)
+
+class ODConv(nn.Module):
+    """使用ODConv2d的卷积模块，包含归一化和激活函数"""
+    def __init__(self, c1, c2, k=1, s=1, p=0, g=1, d=1, activation=nn.SiLU()):
+        """
+        Args:
+            c1: 输入通道数
+            c2: 输出通道数
+            k: 卷积核大小
+            s: 步长
+            p:  padding
+            g: 分组数
+            d:  dilation
+            activation: 激活函数
+        """
+        super().__init__()
+        # 使用ODConv2d替代普通卷积
+        self.conv = ODConv2d(
+            in_planes=c1,
+            out_planes=c2,
+            kernel_size=k,
+            stride=s,
+            padding=p,
+            dilation=d,
+            groups=g,
+            kernel_num=4  # 可根据需求调整
+        )
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = activation if activation is not None else nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+class C2fOD(nn.Module):
+    """使用ODConv的C2f模块（C2fPSA的父类）"""
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)  # 隐藏通道数
+        # 使用ODConv替代原Conv
+        self.cv1 = ODConv(c1, 2 * self.c, 1, 1)
+        self.cv2 = ODConv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(
+            Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
+            for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+# class C2fPSA_OD(C2f_OD):
+#     """使用ODConv的C2fPSA模块"""
+#     def __init__(self, c1, c2, n=1, e=0.5):
+#         assert c1 == c2, "输入输出通道数需一致"
+#         super().__init__(c1, c2, n=n, e=e)
+#         # 替换为PSABlock，保持ODConv的一致性
+#         self.m = nn.ModuleList(
+#             PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64)
+#             for _ in range(n)
+#         )
+
+class C2fPSAOD(C2fOD):
+    """支持通道数变化的C2fPSA_OD模块"""
+
+    def __init__(self, c1, c2, n=1, e=0.5):
+        # 移除断言，允许c1≠c2
+        super().__init__(c1, c2, n=n, e=e)
+
+        # 通道数适配
+        if c1 != self.c * 2:
+            self.cv1 = ODConv(c1, 2 * self.c, 1)
+
+        self.m = nn.ModuleList(
+            PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64)
+            for _ in range(n)
+        )
+
+        # 输出通道适配
+        if 2 * self.c + n * self.c != c2:
+            self.cv2 = ODConv((2 + n) * self.c, c2, 1)
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class BiFPN(nn.Module):
+    """双向特征金字塔网络"""
+
+    def __init__(self, c1_list, c2, num_layers=2, epsilon=1e-4):
+        """
+        Args:
+            c1_list: 输入通道列表（多尺度输入通道数）
+            c2: 输出通道数
+            num_layers: 堆叠层数
+            epsilon: 防止数值不稳定
+        """
+        super().__init__()
+        self.epsilon = epsilon
+        self.num_layers = num_layers
+        self.out_channels = c2
+
+        # 通道对齐 - 为每个输入特征图创建对应的1x1卷积
+        self.align_convs = nn.ModuleList([
+            Conv(in_c, c2, 1) for in_c in c1_list
+        ])
+
+        # 权重参数（简化版双向融合）
+        self.weights = nn.ParameterList([
+            nn.Parameter(torch.ones(len(c1_list), dtype=torch.float32), requires_grad=True)
+            for _ in range(num_layers)
+        ])
+
+        # 特征融合层 - 修正Conv参数
+        self.fusion_ops = nn.ModuleList([
+            nn.Sequential(
+                Conv(c2, c2, 3, 1, 1),  # k=3, s=1, p=1
+                EMA(c2)  # 添加EMA增强特征
+            ) for _ in range(num_layers)
+        ])
+
+    def forward(self, inputs):
+        """处理多尺度输入"""
+        # 输入特征对齐到统一通道数
+        aligned_features = [conv(x) for conv, x in zip(self.align_convs, inputs)]
+
+        # 获取统一的特征图尺寸（使用第一个特征图的尺寸作为目标）
+        target_size = aligned_features[0].shape[2:]
+
+        # 双向特征融合
+        for i in range(self.num_layers):
+            # 尺寸对齐
+            resized_features = []
+            for feat in aligned_features:
+                if feat.shape[2:] != target_size:
+                    resized_feat = F.interpolate(feat, size=target_size, mode='bilinear', align_corners=False)
+                    resized_features.append(resized_feat)
+                else:
+                    resized_features.append(feat)
+
+            # 加权融合
+            weights = torch.softmax(self.weights[i], dim=0)
+            fused = sum(w * feat for w, feat in zip(weights, resized_features))
+
+            # 特征增强
+            fused = self.fusion_ops[i](fused)
+
+            # 更新特征（简化处理）
+            aligned_features = [fused] * len(aligned_features)
+
+        return fused  # 返回单张量输出
+
+
+class WindowAttention(nn.Module):
+    """窗口注意力机制，基于Swin Transformer的实现"""
+
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size if isinstance(window_size, (list, tuple)) else (window_size, window_size)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: input features with shape of (B, N, C) where N = window_size*window_size
+        """
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+        attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+# def window_partition(x, window_size):
+#     """
+#     Args:
+#         x: (B, H, W, C)
+#         window_size (int): window size
+#
+#     Returns:
+#         windows: (num_windows*B, window_size, window_size, C)
+#     """
+#     B, H, W, C = x.shape
+#     window_size_h, window_size_w = window_size if isinstance(window_size, (list, tuple)) else (window_size, window_size)
+#     x = x.view(B, H // window_size_h, window_size_h, W // window_size_w, window_size_w, C)
+#     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size_h, window_size_w, C)
+#     return windows
+
+class SwinAttentionBlock(nn.Module):
+    """简化版的Swin Transformer注意力块，支持任意尺寸输入"""
+
+    def __init__(self, dim, num_heads=8, window_size=7, mlp_ratio=4.,
+                 qkv_bias=True, drop=0., attn_drop=0., act_layer=nn.GELU):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = WindowAttention(
+            dim, window_size=window_size, num_heads=num_heads,
+            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            act_layer(),
+            nn.Dropout(drop),
+            nn.Linear(int(dim * mlp_ratio), dim),
+            nn.Dropout(drop)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+
+        # 转换为适合窗口注意力的格式
+        x = x.permute(0, 2, 3, 1)  # B, H, W, C
+
+        # 保存原始尺寸用于恢复
+        ori_H, ori_W = H, W
+
+        # 确保窗口大小不超过特征图大小
+        window_size_h = min(self.window_size, H)
+        window_size_w = min(self.window_size, W)
+        window_size = (window_size_h, window_size_w)
+
+        # 窗口分区（自动处理填充）
+        x_windows = window_partition(x, window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, window_size_h * window_size_w, C)  # nW*B, window_size*window_size, C
+
+        # 窗口注意力
+        attn_windows = self.attn(x_windows)  # nW*B, window_size*window_size, C
+
+        # 窗口合并（自动处理去填充）
+        attn_windows = attn_windows.view(-1, window_size_h, window_size_w, C)
+        shifted_x = window_reverse(attn_windows, window_size, ori_H, ori_W)  # B, H, W, C
+
+        # 转换回卷积格式
+        x = shifted_x.permute(0, 3, 1, 2)  # B, C, H, W
+
+        return x
+
+
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    window_size_h, window_size_w = window_size if isinstance(window_size, (list, tuple)) else (window_size, window_size)
+
+    # 计算需要填充的尺寸
+    pad_h = (window_size_h - H % window_size_h) % window_size_h
+    pad_w = (window_size_w - W % window_size_w) % window_size_w
+
+    # 如果需要填充，则进行填充
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+
+    # 更新尺寸
+    Hp, Wp = x.shape[1], x.shape[2]
+
+    # 现在可以安全地进行分区
+    x = x.view(B, Hp // window_size_h, window_size_h, Wp // window_size_w, window_size_w, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size_h, window_size_w, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+
+    Returns:
+        x: (B, H, W, C)
+    """
+    window_size_h, window_size_w = window_size if isinstance(window_size, (list, tuple)) else (window_size, window_size)
+
+    # 计算填充后的尺寸
+    pad_h = (window_size_h - H % window_size_h) % window_size_h
+    pad_w = (window_size_w - W % window_size_w) % window_size_w
+    Hp, Wp = H + pad_h, W + pad_w
+
+    B = int(windows.shape[0] / (Hp * Wp / window_size_h / window_size_w))
+    x = windows.view(B, Hp // window_size_h, Wp // window_size_w, window_size_h, window_size_w, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
+
+    # 移除填充
+    if pad_h > 0 or pad_w > 0:
+        x = x[:, :H, :W, :].contiguous()
+
+    return x
+
+
+class PSABlockSwin(nn.Module):
+    """
+    使用窗口注意力的PSABlock模块，解决内存溢出问题
+    """
+
+    def __init__(self, c, attn_ratio=0.5, num_heads=4, shortcut=True, window_size=7) -> None:
+        """
+        Initialize the PSABlock with window attention.
+
+        Args:
+            c (int): Input and output channels.
+            attn_ratio (float): Attention ratio for key dimension.
+            num_heads (int): Number of attention heads.
+            shortcut (bool): Whether to use shortcut connections.
+            window_size (int): Window size for local attention.
+        """
+        super().__init__()
+
+        # 使用窗口注意力替代全局注意力
+        self.attn = SwinAttentionBlock(c, num_heads=num_heads, window_size=window_size)
+
+        # 保持原有的FFN结构，但使用ODConv
+        self.ffn = nn.Sequential(
+            ODConv(c, c * 2, 1),
+            ODConv(c * 2, c, 1, activation=None)
+        )
+        self.add = shortcut
+
+    def forward(self, x):
+        """
+        Execute a forward pass through PSABlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor after attention and feed-forward processing.
+        """
+        # 注意力处理
+        attn_out = self.attn(x)
+        x = x + attn_out if self.add else attn_out
+
+        # FFN处理
+        ffn_out = self.ffn(x)
+        x = x + ffn_out if self.add else ffn_out
+
+        return x
+
+
+class C2fPSAODSwin(nn.Module):
+    """使用窗口注意力和ODConv的C2fPSA模块"""
+
+    def __init__(self, c1, c2, n=1, e=0.5, num_heads=4, window_size=7):
+        """
+        Args:
+            c1: 输入通道数
+            c2: 输出通道数
+            n: Bottleneck块的数量
+            e: 扩展比例
+            num_heads: 注意力头数
+            window_size: 窗口大小
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # 隐藏通道数
+
+        # 使用ODConv替代原Conv
+        self.cv1 = ODConv(c1, 2 * self.c, 1, 1)
+        self.cv2 = ODConv((2 + n) * self.c, c2, 1)
+
+        # 使用窗口注意力的PSABlock
+        self.m = nn.ModuleList(
+            PSABlockSwin(self.c, attn_ratio=0.5, num_heads=num_heads, window_size=window_size)
+            for _ in range(n)
+        )
+
+    def forward(self, x):
+        """前向传播"""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
