@@ -770,15 +770,27 @@ class ClassificationDataset:
         """
         f, j, fn, im = self.samples[i]  # filename, index, filename.with_suffix('.npy'), image
         if self.cache_ram:
-            if im is None:  # Warning: two separate if statements required here, do not combine this with previous line
+            if im is None:
                 im = self.samples[i][3] = cv2.imread(f)
         elif self.cache_disk:
-            if not fn.exists():  # load npy
-                np.save(fn.as_posix(), cv2.imread(f), allow_pickle=False)
+            if not fn.exists():
+                img_array = cv2.imread(f)
+                if img_array is None:
+                    raise ValueError(f"Failed to read image {f} for disk caching")
+                np.save(fn.as_posix(), img_array, allow_pickle=False)
             im = np.load(fn)
         else:  # read image
             im = cv2.imread(f)  # BGR
-        # Convert NumPy array to PIL image
+
+            # 添加空图像检查
+        if im is None or im.size == 0:
+            raise ValueError(f"Empty image loaded from {f}")
+
+            # 添加形状检查
+        if im.ndim != 3 or im.shape[2] != 3:
+            raise ValueError(f"Invalid image shape {im.shape} for {f}")
+
+            # Convert NumPy array to PIL image
         im = Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
         sample = self.torch_transforms(im)
         return {"img": sample, "cls": j}

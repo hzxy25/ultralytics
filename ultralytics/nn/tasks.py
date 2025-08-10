@@ -12,6 +12,11 @@ import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
+    GAP,
+    ASPP,
+    STN,
+    CBAM,
+    SE,
     C2fPSAODSwin,
     PSABlockSwin,
     BiFPN,
@@ -592,8 +597,8 @@ class ClassificationModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the ClassificationModel."""
-        # return v8ClassificationLoss()
-        return FineGrainedLoss(self.yaml["nc"])
+        return v8ClassificationLoss()
+        # return FineGrainedLoss(self.yaml["nc"])
 
 class FineGrainedLoss(nn.Module):
     def __init__(self, nc):
@@ -1422,6 +1427,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     base_modules = frozenset(
         {
+            ASPP,
             Classify,
             Conv,
             ConvTranspose,
@@ -1523,6 +1529,15 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
+        elif m is STN:
+            c1 = c2 = ch[-1]  # 输入输出通道相同
+            args = [c1, *args]  # 构建参数列表
+        elif m is SE:
+            c1 = c2 = ch[-1]
+            args = [c1,*args[:]]
+        elif m is CBAM:
+            c1 = c2 =ch[-1]
+            args = [c1,*args[:]]
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

@@ -2235,71 +2235,6 @@ class C2fPSAOD(C2fOD):
         return self.cv2(torch.cat(y, 1))
 
 
-class BiFPN(nn.Module):
-    """双向特征金字塔网络"""
-
-    def __init__(self, c1_list, c2, num_layers=2, epsilon=1e-4):
-        """
-        Args:
-            c1_list: 输入通道列表（多尺度输入通道数）
-            c2: 输出通道数
-            num_layers: 堆叠层数
-            epsilon: 防止数值不稳定
-        """
-        super().__init__()
-        self.epsilon = epsilon
-        self.num_layers = num_layers
-        self.out_channels = c2
-
-        # 通道对齐 - 为每个输入特征图创建对应的1x1卷积
-        self.align_convs = nn.ModuleList([
-            Conv(in_c, c2, 1) for in_c in c1_list
-        ])
-
-        # 权重参数（简化版双向融合）
-        self.weights = nn.ParameterList([
-            nn.Parameter(torch.ones(len(c1_list), dtype=torch.float32), requires_grad=True)
-            for _ in range(num_layers)
-        ])
-
-        # 特征融合层 - 修正Conv参数
-        self.fusion_ops = nn.ModuleList([
-            nn.Sequential(
-                Conv(c2, c2, 3, 1, 1),  # k=3, s=1, p=1
-                EMA(c2)  # 添加EMA增强特征
-            ) for _ in range(num_layers)
-        ])
-
-    def forward(self, inputs):
-        """处理多尺度输入"""
-        # 输入特征对齐到统一通道数
-        aligned_features = [conv(x) for conv, x in zip(self.align_convs, inputs)]
-
-        # 获取统一的特征图尺寸（使用第一个特征图的尺寸作为目标）
-        target_size = aligned_features[0].shape[2:]
-
-        # 双向特征融合
-        for i in range(self.num_layers):
-            # 尺寸对齐
-            resized_features = []
-            for feat in aligned_features:
-                if feat.shape[2:] != target_size:
-                    resized_feat = F.interpolate(feat, size=target_size, mode='bilinear', align_corners=False)
-                    resized_features.append(resized_feat)
-                else:
-                    resized_features.append(feat)
-
-            # 加权融合
-            weights = torch.softmax(self.weights[i], dim=0)
-            fused = sum(w * feat for w, feat in zip(weights, resized_features))
-
-            # 特征增强
-            fused = self.fusion_ops[i](fused)
-
-            # 更新特征（简化处理）
-            aligned_features = [fused] * len(aligned_features)
-
-        return fused  # 返回单张量输出
 
 
 class WindowAttention(nn.Module):
@@ -2553,3 +2488,306 @@ class C2fPSAODSwin(nn.Module):
         y = list(self.cv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
+
+
+class SE(nn.Module):
+    """
+    Squeeze-and-Excitation (SE) module for channel-wise attention.
+
+    Proposed in "Squeeze-and-Excitation Networks" (https://arxiv.org/abs/1709.01507)
+
+    Args:
+        c1 (int): Number of input channels.
+        r (int): Reduction ratio (default=16).
+
+    Attributes:
+        squeeze (nn.AdaptiveAvgPool2d): Global average pooling.
+        excitation (nn.Sequential): Two FC layers with ReLU and Sigmoid.
+    """
+
+    def __init__(self, c1, r=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(c1, c1 // r, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c1 // r, c1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """Apply channel-wise attention to input features."""
+        b, c, _, _ = x.size()
+        y = self.squeeze(x).view(b, c)
+        y = self.excitation(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class STN(nn.Module):
+    """
+    Spatial Transformer Network (STN) for automatic region focusing
+
+    Args:
+        c (int): Input channels (automatically passed by model parser)
+        *args: Optional arguments [reduction_ratio]
+    """
+
+    def __init__(self, c, *args):
+        super().__init__()
+        # 解析可选参数
+        reduction_ratio = args[0] if len(args) > 0 else 16
+
+        # 定位网络（生成变换参数）
+        self.localization = nn.Sequential(
+            nn.Conv2d(c, c // reduction_ratio, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c // reduction_ratio, c // reduction_ratio, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1)
+        )
+
+        # 回归网络（预测6个仿射变换参数）
+        self.fc_loc = nn.Sequential(
+            nn.Linear(c // reduction_ratio, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 3 * 2)  # 输出6个参数
+        )
+
+        # 初始化变换矩阵为单位矩阵
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+
+    def forward(self, x):
+        """Apply spatial transformation to input"""
+        # 获取变换参数
+        loc = self.localization(x)
+        loc = loc.view(loc.size(0), -1)
+        theta = self.fc_loc(loc)
+        theta = theta.view(-1, 2, 3)
+
+        # 应用仿射变换
+        grid = F.affine_grid(theta, x.size(), align_corners=False)
+        return F.grid_sample(x, grid, align_corners=False)
+
+
+class ASPP(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling (ASPP) 模块
+
+    Args:
+        c (int): 输入通道数
+        out_channels (int): 输出通道数
+        atrous_rates (tuple): 空洞卷积的扩张率列表
+    """
+
+    def __init__(self, c, out_channels=256, atrous_rates=(6, 12, 18)):
+        super().__init__()
+
+        # 1. 1x1卷积分支 (无空洞)
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(c, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # 2. 空洞卷积分支 (多个不同扩张率)
+        self.atrous_convs = nn.ModuleList()
+        for rate in atrous_rates:
+            self.atrous_convs.append(nn.Sequential(
+                nn.Conv2d(c, out_channels, 3, padding=rate, dilation=rate, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ))
+
+        # 3. 全局平均池化分支
+        self.global_avg_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # (B, C, 1, 1)
+            nn.Conv2d(c, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # 4. 输出融合层
+        self.fusion = nn.Sequential(
+            nn.Conv2d(5 * out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        """前向传播"""
+        # 原始输入尺寸
+        b, c, h, w = x.size()
+
+        # 1. 1x1卷积分支
+        conv1x1 = self.conv1x1(x)  # (B, 256, H, W)
+
+        # 2. 空洞卷积分支
+        atrous_outputs = [conv(x) for conv in self.atrous_convs]  # 3x (B, 256, H, W)
+
+        # 3. 全局平均池化分支 (需要上采样)
+        gap = self.global_avg_pool(x)  # (B, 256, 1, 1)
+        gap = F.interpolate(gap, size=(h, w), mode='bilinear', align_corners=False)  # (B, 256, H, W)
+
+        # 4. 拼接所有分支
+        outputs = [conv1x1] + atrous_outputs + [gap]  # 5个特征图
+        concat = torch.cat(outputs, dim=1)  # (B, 1280, H, W)
+
+        # 5. 融合输出
+        return self.fusion(concat)  # (B, 256, H, W)
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BiFPN(nn.Module):
+    """
+    双向特征金字塔网络 (BiFPN) - 用于高效的多尺度特征融合
+
+    Args:
+        in_channels_list (list[int]): 输入特征图的通道数列表
+        out_channels (int): 输出通道数
+        num_layers (int): BiFPN堆叠层数 (默认=2)
+        epsilon (float): 防止数值不稳定的小值 (默认=1e-4)
+        attention (bool): 是否使用注意力加权 (默认=True)
+    """
+
+    def __init__(self, in_channels_list, out_channels, num_layers=2, epsilon=1e-4, attention=True):
+        super().__init__()
+        self.epsilon = epsilon
+        self.num_layers = num_layers
+        self.out_channels = out_channels
+        self.attention = attention
+        self.num_inputs = len(in_channels_list)
+
+        # 1. 通道对齐层 - 1x1卷积统一通道数
+        self.align_convs = nn.ModuleList()
+        for in_channels in in_channels_list:
+            self.align_convs.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True)
+                )
+            )
+
+        # 2. 双向融合层 - 堆叠多层BiFPN
+        self.bifpn_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.bifpn_layers.append(BiFPNLayer(out_channels, self.num_inputs, epsilon, attention))
+
+    def forward(self, inputs):
+        """
+        前向传播
+
+        Args:
+            inputs (list[Tensor]): 输入特征图列表
+
+        Returns:
+            Tensor: 融合后的特征图 (B, out_channels, H, W)
+        """
+        # 0. 验证输入
+        assert len(inputs) == self.num_inputs, \
+            f"输入特征图数量({len(inputs)})应与初始化数量({self.num_inputs})匹配"
+
+        # 1. 通道对齐
+        aligned_features = [conv(x) for conv, x in zip(self.align_convs, inputs)]
+
+        # 2. 逐层应用BiFPN
+        for bifpn_layer in self.bifpn_layers:
+            aligned_features = bifpn_layer(aligned_features)
+
+        # 3. 返回最终融合特征 (使用第一个特征图尺寸)
+        return aligned_features[0]
+
+
+class BiFPNLayer(nn.Module):
+    """修复后的BiFPN单层实现"""
+
+    def __init__(self, channels, num_inputs, epsilon=1e-4, attention=True):
+        super().__init__()
+        self.channels = channels
+        self.num_inputs = num_inputs
+        self.epsilon = epsilon
+        self.attention = attention
+
+        # 特征融合卷积
+        self.fusion_convs = nn.ModuleList()
+        for i in range(num_inputs):
+            self.fusion_convs.append(
+                nn.Sequential(
+                    nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                    nn.ReLU(inplace=True)
+                )
+            )
+
+        # 注意力权重
+        if attention:
+            self.weights = nn.ParameterList([
+                nn.Parameter(torch.ones(2, dtype=torch.float32))
+                for _ in range(num_inputs - 1)
+            ])
+
+    def forward(self, features):
+        """修复后的前向传播"""
+        # 1. 自顶向下路径
+        top_down = features[-1]
+        top_down_path = [top_down]
+
+        for i in range(len(features) - 2, -1, -1):
+            # 自适应上采样到当前层尺寸
+            target_size = features[i].shape[2:]
+            upsampled = F.interpolate(top_down, size=target_size, mode='bilinear', align_corners=False)
+
+            # 加权融合
+            if self.attention:
+                w = F.relu(self.weights[i])
+                weight = w / (torch.sum(w, dim=0) + self.epsilon)
+                top_down = weight[0] * features[i] + weight[1] * upsampled
+            else:
+                top_down = 0.5 * (features[i] + upsampled)
+
+            # 融合卷积
+            top_down = self.fusion_convs[i](top_down)
+            top_down_path.insert(0, top_down)
+
+        # 2. 自底向上路径
+        bottom_up = top_down_path[0]
+        bottom_up_path = [bottom_up]
+
+        for i in range(1, len(features)):
+            # 自适应下采样到目标尺寸
+            target_size = top_down_path[i].shape[2:]
+            downsampled = F.interpolate(bottom_up, size=target_size, mode='bilinear', align_corners=False)
+
+            # 加权融合
+            if self.attention:
+                w = F.relu(self.weights[i - 1])
+                weight = w / (torch.sum(w, dim=0) + self.epsilon)
+                bottom_up = weight[0] * top_down_path[i] + weight[1] * downsampled
+            else:
+                bottom_up = 0.5 * (top_down_path[i] + downsampled)
+
+            # 融合卷积
+            bottom_up = self.fusion_convs[i](bottom_up)
+            bottom_up_path.append(bottom_up)
+
+        return bottom_up_path
+
+
+class GAP(nn.Module):
+    """
+    Global Average Pooling (GAP) 模块
+    对输入特征图进行全局平均池化，将每个通道的特征图压缩为一个值
+    输入形状: (batch_size, channels, height, width)
+    输出形状: (batch_size, channels, 1, 1)
+    """
+    def __init__(self):
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+    def forward(self, x):
+        """应用全局平均池化"""
+        return self.avgpool(x)

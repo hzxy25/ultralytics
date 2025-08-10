@@ -9,15 +9,21 @@ from ultralytics import YOLO
 # model.train(data = "ultralytics/cfg/datasets/mydata.yaml",
 #             epochs = 50,batch = 12,workers=0)
 def main():
-
     # Load a model
-    model = YOLO("yolo11n-cls.pt")  # load a pretrained model (recommended for training)
+    # model = YOLO("yolo11s-cls.yaml",task='classify')  # load a pretrained model (recommended for training)
+    model = YOLO("cgyolo11s-cls.yaml",task='classify')  # load a pretrained model (recommended for training)
     # Train the model
     results = model.train(
-        data="E:\下载\Compressed\WebFG-496-yolo",
-        epochs=40,
-        imgsz=640,
-        workers=0)
+        # data="/root/autodl-tmp/data/webfg400",
+        # data=r"E:\tool\Data\WebFG-496-yolo",
+        data=r"E:\tool\Data\testClassification",
+
+        epochs=200,
+        imgsz=384,
+        save_period=10,
+        batch=4,
+        workers=0
+    )
 
 
 if __name__ == "__main__":

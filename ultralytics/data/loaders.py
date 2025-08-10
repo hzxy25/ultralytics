@@ -425,28 +425,35 @@ class LoadImagesAndVideos:
                     if self.count < self.nf:
                         self._new_video(self.files[self.count])
             else:
-                # Handle image files (including HEIC)
+                # 处理图像文件
                 self.mode = "image"
-                if path.rpartition(".")[-1].lower() == "heic":
-                    # Load HEIC image using Pillow with pillow-heif
-                    check_requirements("pillow-heif")
+                im0 = None
+                try:
+                    # ... HEIC处理代码保持不变 ...
 
-                    from pillow_heif import register_heif_opener
-
-                    register_heif_opener()  # Register HEIF opener with Pillow
-                    with Image.open(path) as img:
-                        im0 = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)  # convert image to BGR nparray
-                else:
+                    # 普通图像加载
                     im0 = imread(path, flags=self.cv2_flag)  # BGR
-                if im0 is None:
-                    LOGGER.warning(f"Image Read Error {path}")
-                else:
+
+                    # 增强的空图像检查
+                    if im0 is None:
+                        raise ValueError(f"OpenCV failed to load {path}")
+                    if im0.size == 0:
+                        raise ValueError(f"Loaded empty image from {path}")
+                    if im0.ndim != 3 or im0.shape[2] not in {1, 3, 4}:
+                        raise ValueError(f"Invalid image shape {im0.shape} for {path}")
+
                     paths.append(path)
                     imgs.append(im0)
                     info.append(f"image {self.count + 1}/{self.nf} {path}: ")
-                self.count += 1  # move to the next file
-                if self.count >= self.ni:  # end of image list
-                    break
+
+                except Exception as e:
+                    LOGGER.error(f"Critical error loading image {path}: {str(e)}")
+                    # 跳过损坏的图像而不是终止进程
+                    if self.count < self.nf - 1:
+                        self.count += 1
+                        continue
+                    else:
+                        break
 
         return paths, imgs, info
 

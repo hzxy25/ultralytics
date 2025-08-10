@@ -18,6 +18,10 @@ Examples:
 """
 
 from .block import (
+    GAP,
+    ASPP,
+    STN,
+    SE,
     C2fPSAODSwin,
     PSABlockSwin,
     BiFPN,
